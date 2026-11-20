@@ -5,28 +5,35 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flohansen/semconvmetric"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
-	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/semconv/v1.43.0/messagingconv"
 )
 
 const meterName = "github.com/flohansen/konsumer"
 
 type MetricHandler struct {
-	next    Handler
-	metrics semconvmetric.MessagingConsumer
+	next            Handler
+	system          messagingconv.SystemAttr
+	processDuration messagingconv.ProcessDuration
 }
 
-func HandlerWithMetrics() func(next Handler) Handler {
+// HandlerWithMetrics returns a decorator that records the
+// "messaging.process.duration" metric for each handled message.
+//
+// The system parameter is reported as the "messaging.system" attribute and
+// should be the OpenTelemetry semantic convention value for the messaging
+// system in use, e.g. "kafka", "rabbitmq" or "aws_sqs". See
+// https://opentelemetry.io/docs/specs/semconv/registry/attributes/messaging/
+func HandlerWithMetrics(system string) func(next Handler) Handler {
 	meter := otel.Meter(meterName)
-	metrics := Must(semconvmetric.NewMessagingConsumer(meter))
+	processDuration := Must(messagingconv.NewProcessDuration(meter))
 
 	return func(next Handler) Handler {
 		return &MetricHandler{
-			next:    next,
-			metrics: metrics,
+			next:            next,
+			system:          messagingconv.SystemAttr(system),
+			processDuration: processDuration,
 		}
 	}
 }
@@ -36,27 +43,36 @@ func (m *MetricHandler) Handle(ctx context.Context, msg Message) error {
 	err := m.next.Handle(ctx, msg)
 	elapsed := time.Since(start).Seconds()
 
-	attrs := attrsWithErr([]attribute.KeyValue{
-		semconv.MessagingOperationName("process"),
-	}, err)
-
-	m.metrics.ProcessDuration.Record(ctx, elapsed, metric.WithAttributes(attrs...))
+	m.processDuration.Record(ctx, elapsed, "process", m.system, errAttrs(err)...)
 	return err
 }
 
 type MetricClient struct {
-	next    Client
-	metrics semconvmetric.MessagingConsumer
+	next              Client
+	system            messagingconv.SystemAttr
+	consumedMessages  messagingconv.ClientConsumedMessages
+	operationDuration messagingconv.ClientOperationDuration
 }
 
-func ClientWithMetrics() func(next Client) Client {
+// ClientWithMetrics returns a decorator that records the
+// "messaging.client.consumed.messages" and "messaging.client.operation.duration"
+// metrics for receive and commit operations.
+//
+// The system parameter is reported as the "messaging.system" attribute and
+// should be the OpenTelemetry semantic convention value for the messaging
+// system in use, e.g. "kafka", "rabbitmq" or "aws_sqs". See
+// https://opentelemetry.io/docs/specs/semconv/registry/attributes/messaging/
+func ClientWithMetrics(system string) func(next Client) Client {
 	meter := otel.Meter(meterName)
-	metrics := Must(semconvmetric.NewMessagingConsumer(meter))
+	consumedMessages := Must(messagingconv.NewClientConsumedMessages(meter))
+	operationDuration := Must(messagingconv.NewClientOperationDuration(meter))
 
 	return func(next Client) Client {
 		return &MetricClient{
-			next:    next,
-			metrics: metrics,
+			next:              next,
+			system:            messagingconv.SystemAttr(system),
+			consumedMessages:  consumedMessages,
+			operationDuration: operationDuration,
 		}
 	}
 }
@@ -66,12 +82,9 @@ func (m *MetricClient) Receive(ctx context.Context) ([]Message, error) {
 	msgs, err := m.next.Receive(ctx)
 	elapsed := time.Since(start).Seconds()
 
-	attrs := attrsWithErr([]attribute.KeyValue{
-		semconv.MessagingOperationName("receive"),
-	}, err)
-
-	m.metrics.ClientConsumedMessages.Add(ctx, int64(len(msgs)), metric.WithAttributes(attrs...))
-	m.metrics.ClientOperationDuration.Record(ctx, elapsed, metric.WithAttributes(attrs...))
+	attrs := errAttrs(err)
+	m.consumedMessages.Add(ctx, int64(len(msgs)), "receive", m.system, attrs...)
+	m.operationDuration.Record(ctx, elapsed, "receive", m.system, attrs...)
 	return msgs, err
 }
 
@@ -80,17 +93,15 @@ func (m *MetricClient) Commit(ctx context.Context, msg Message) error {
 	err := m.next.Commit(ctx, msg)
 	elapsed := time.Since(start).Seconds()
 
-	attrs := attrsWithErr([]attribute.KeyValue{
-		semconv.MessagingOperationName("settle"),
-	}, err)
-
-	m.metrics.ClientOperationDuration.Record(ctx, elapsed, metric.WithAttributes(attrs...))
+	m.operationDuration.Record(ctx, elapsed, "settle", m.system, errAttrs(err)...)
 	return err
 }
 
-func attrsWithErr(attrs []attribute.KeyValue, err error) []attribute.KeyValue {
-	if err != nil {
-		return append(attrs, semconv.ErrorType(fmt.Errorf("%T", err)))
+func errAttrs(err error) []attribute.KeyValue {
+	if err == nil {
+		return nil
 	}
-	return attrs
+	return []attribute.KeyValue{
+		attribute.String("error.type", fmt.Sprintf("%T", err)),
+	}
 }

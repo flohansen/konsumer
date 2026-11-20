@@ -33,14 +33,14 @@ func main() {
 	client := konsumer.Decorate(
 		konsumer.Client(newFakeClientWithDummyData()),
 		konsumer.ClientWithTracing(),
-		konsumer.ClientWithMetrics(),
+		konsumer.ClientWithMetrics("kafka"),
 		konsumer.ClientWithLogging(logger),
 	)
 
 	handler := konsumer.Decorate(
 		konsumer.Handler(&myHandler{}),
 		konsumer.HandlerWithTracing(),
-		konsumer.HandlerWithMetrics(),
+		konsumer.HandlerWithMetrics("kafka"),
 		konsumer.HandlerWithRetries(),
 		konsumer.HandlerWithLogging(logger),
 	)
